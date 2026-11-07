@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""agent-auto-close - close a running Claude session, leaving it resumable in its tmux pane.
+
+  agent-auto-close close <uuid | uuid prefix | %pane>   close one Claude session by hand
+  agent-auto-close idle --over <hours> [--dry-run]       close the Claude sessions idle for longer than <hours>
+
+A close: capture the tmux pane's screen, SIGTERM the Claude process (never SIGKILL: Claude Code
+flushes its transcript on SIGTERM), write the screen file, cat it back into the pane and pre-type
+`claude --resume <uuid>` there (no Enter). Ported from `asm close` (agent-session-manager
+src/asm, lines 1538-1750, v4.7), with two more safety checks (the pid's start time, and the pane
+really holding the pid).
+
+Reads:  $CLAUDE_CONFIG_DIR/sessions/<pid>.json (Claude Code's own file per running Claude session),
+        $CLAUDE_CONFIG_DIR/projects/*/<uuid>.jsonl (transcripts, for the last prompt),
+        `agent-tracker now --json` when it is on the PATH (last prompt, pane, transcript).
+Writes: $AGENT_AUTO_CLOSE_HOME/data/close-screens/<uuid>.txt, $AGENT_AUTO_CLOSE_HOME/logs/close.jsonl
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+VERSION = "1.0"
+APP_HOME = os.environ.get("AGENT_AUTO_CLOSE_HOME") or os.path.expanduser("~/opt/agent-auto-close")
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+SCREENS_DIR = os.path.join(APP_HOME, "data", "close-screens")
+LOG_PATH = os.path.join(APP_HOME, "logs", "close.jsonl")
+TERM_TIMEOUT_S = 5.0          # asm close's value: wait this long for the process to exit after SIGTERM
+LSTART_RE = re.compile(r"^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d+ \d\d:\d\d:\d\d \d{4}$")   # `ps -o lstart` shape
+
+
+class Refused(Exception):
+    """A safety check failed: nothing was touched."""
+
+
+class CloseFailed(Exception):
+    """SIGTERM was sent but the process did not exit: the pane was left untouched."""
+
+
+def dt_of(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(v: Any) -> Optional[float]:
+    """Epoch seconds from an epoch number (s or ms), an ISO string, or a dict holding ts/dt."""
+    if isinstance(v, dict):
+        return parse_ts(v.get("ts")) or parse_ts(v.get("dt")) or parse_ts(v.get("timestamp"))
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v / 1000 if v > 1e11 else float(v)
+    if isinstance(v, str) and v:
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def human_age(seconds: float) -> str:
+    """'7m', '3h20m' or '2d13h' (asm's _human_age)."""
+    mins = int(max(0, seconds)) // 60
+    if mins < 60:
+        return f"{mins}m"
+    if mins < 1440:
+        return f"{mins // 60}h{mins % 60}m"
+    return f"{mins // 1440}d{(mins % 1440) // 60}h"
+
+
+def log(row: Dict[str, Any]) -> None:
+    """One line per close or refusal; ts and dt first."""
+    ts = time.time()
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": int(ts), "dt": dt_of(ts), **row}) + "\n")
+
+
+# -- Finding the running Claude sessions -------------------------------------
+
+def tracker_rows() -> Dict[str, Dict[str, Any]]:
+    """`agent-tracker now --json` by uuid, or {} when agent-tracker is not installed or fails.
+    Only used to add the last prompt, the pane and the transcript path; the pid, status and kind
+    always come from $CLAUDE_CONFIG_DIR/sessions/<pid>.json."""
+    if not shutil.which("agent-tracker"):
+        return {}
+    try:
+        out = subprocess.run(["agent-tracker", "now", "--json"], capture_output=True, text=True, timeout=10).stdout
+        doc = json.loads(out)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return {}
+    l_rows = doc.get("sessions", []) if isinstance(doc, dict) else doc
+    return {r.get("uuid"): r for r in l_rows if isinstance(r, dict) and r.get("uuid")}
+
+
+def live_sessions() -> List[Dict[str, Any]]:
+    """Every running local Claude session: Claude Code writes one sessions/<pid>.json per process."""
+    d_tracker = tracker_rows()
+    l_sessions = []
+    for path in sorted(glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(s, dict) and s.get("sessionId"):
+            s["_tracker"] = d_tracker.get(s["sessionId"], {})
+            l_sessions.append(s)
+    return l_sessions
+
+
+def pane_id_of(s: Dict[str, Any]) -> Optional[str]:
+    """The %pane of a session: sessions/<pid>.json's tmux is "session:@window.%pane"."""
+    tail = (s.get("tmux") or "").split(".")[-1]
+    if tail.startswith("%"):
+        return tail
+    pid = s["_tracker"].get("pane_id")
+    return pid if isinstance(pid, str) and pid.startswith("%") else None
+
+
+def find_session(target: str) -> Dict[str, Any]:
+    """The one running Claude session matching a uuid, a uuid prefix or a %pane."""
+    l_sessions = live_sessions()
+    if target.startswith("%"):
+        l_match = [s for s in l_sessions if pane_id_of(s) == target]
+    else:
+        l_match = [s for s in l_sessions if s["sessionId"] == target] or \
+                  [s for s in l_sessions if target and s["sessionId"].startswith(target)]
+    if len(l_match) > 1:
+        lines = "\n".join(f"  pid {s.get('pid')}  {s.get('name')}  {s['sessionId']}" for s in l_match)
+        raise Refused(f"several running Claude sessions match '{target}':\n{lines}")
+    if not l_match:
+        raise Refused(f"no running Claude session matches '{target}' (already exited, or on another machine).")
+    return l_match[0]
+
+
+def transcript_of(s: Dict[str, Any]) -> Optional[str]:
+    path = s["_tracker"].get("transcript")
+    if isinstance(path, str) and os.path.isfile(path):
+        return path
+    l_paths = glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", f"{s['sessionId']}.jsonl"))
+    return max(l_paths, key=os.path.getmtime) if l_paths else None
+
+
+def is_tool_result(entry: Dict[str, Any]) -> bool:
+    """A `user` entry that is really a tool result, not a human prompt (asm's is_tool_result)."""
+    content = (entry.get("message") or {}).get("content", "")
+    return isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+
+
+def last_prompt_ts(s: Dict[str, Any]) -> Optional[float]:
+    """The last prompt's time: agent-tracker's when it gives one, else the end of the transcript
+    (the last `user` entry that is not a tool result). Reads 1 MB from the end, then 4x more each
+    time nothing is found, up to the whole file."""
+    ts = parse_ts(s["_tracker"].get("last_prompt"))
+    if ts:
+        return ts
+    path = transcript_of(s)
+    if not path:
+        return None
+    size, chunk = os.path.getsize(path), 1 << 20
+    while True:
+        start = max(0, size - chunk)
+        with open(path, "rb") as f:
+            f.seek(start)
+            l_lines = f.read().split(b"\n")
+        if start > 0:
+            l_lines = l_lines[1:]          # the first line is cut
+        for raw in reversed(l_lines):
+            if b'"user"' not in raw:
+                continue
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue                   # a line being written right now
+            if isinstance(e, dict) and e.get("type") == "user" and not is_tool_result(e):
+                ts = parse_ts(e.get("timestamp"))
+                if ts:
+                    return ts
+        if start == 0:
+            return None
+        chunk *= 4
+
+
+# -- Safety checks -------------------------------------------------------------
+
+def ps_parents() -> Dict[int, int]:
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+    return {int(a): int(b) for a, b in (l.split() for l in out.splitlines() if len(l.split()) == 2)}
+
+
+def ancestors(pid: int, d_parent: Dict[int, int]) -> List[int]:
+    """pid itself, then its parent, grand-parent... up to pid 1."""
+    l_chain = []
+    while pid and pid not in l_chain:
+        l_chain.append(pid)
+        pid = d_parent.get(pid, 0)
+    return l_chain
+
+
+def check_closeable(s: Dict[str, Any]) -> str:
+    """Every safety check, cheapest first, before anything is captured or signalled; returns the %pane.
+    The first six are asm close's; the pid start time and the pane-holds-pid checks are new: they stop
+    a stale sessions/<pid>.json from sending SIGTERM or keys to a process or pane that is not its own."""
+    pid, uuid = s.get("pid"), s["sessionId"]
+    d_parent = ps_parents()
+    if os.environ.get("CLAUDE_CODE_SESSION_ID") == uuid or (isinstance(pid, int) and pid in ancestors(os.getpid(), d_parent)):
+        raise Refused("refusing to close the Claude session this command is running from.")
+    if s.get("status") == "busy":
+        raise Refused("the Claude session is busy (mid-task): never close a busy Claude session.")
+    if s.get("kind") != "interactive":
+        raise Refused(f"the Claude session's kind is '{s.get('kind')}', not 'interactive': not handled.")
+    pane_id = pane_id_of(s)
+    if not pane_id:
+        raise Refused("the Claude session has no tmux pane (not run in tmux): not handled.")
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, TypeError, OverflowError):
+        raise Refused(f"pid {pid} is not running: stale sessions/{pid}.json.")
+    except PermissionError:
+        raise Refused(f"pid {pid} belongs to another user.")
+    proc_start = s.get("procStart") or ""
+    if LSTART_RE.match(proc_start):     # Claude Code writes `ps -o lstart` in UTC, C locale
+        lstart = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                                env={**os.environ, "TZ": "UTC", "LC_ALL": "C"}).stdout
+        if " ".join(lstart.split()) != " ".join(proc_start.split()):
+            raise Refused(f"pid {pid} started at '{lstart.strip()}', not '{proc_start}': the pid was reused, stale sessions/{pid}.json.")
+    out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"], capture_output=True, text=True).stdout
+    d_pane_pid = {a: int(b) for a, b in (l.split() for l in out.splitlines() if len(l.split()) == 2)}
+    if pane_id not in d_pane_pid:
+        raise Refused(f"tmux pane {pane_id} (from '{s.get('tmux')}') no longer exists: stale reference.")
+    if d_pane_pid[pane_id] not in ancestors(pid, d_parent):
+        raise Refused(f"tmux pane {pane_id} does not hold pid {pid}: stale reference.")
+    return pane_id
+
+
+# -- The close -------------------------------------------------------------------
+
+def rss_mb(pid: int) -> Optional[int]:
+    out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return int(out) // 1024 if out.isdigit() else None
+
+
+def terminate(pid: int) -> None:
+    """SIGTERM and wait for the process to go; never SIGKILL (asm's _terminate)."""
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + TERM_TIMEOUT_S
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.25)
+    raise CloseFailed(f"pid {pid} did not exit within {TERM_TIMEOUT_S:.0f} s of SIGTERM: the pane was left untouched; "
+                      f"check it by hand before retrying (it may be flushing a large transcript).")
+
+
+def close(s: Dict[str, Any], by: str) -> str:
+    """Close one running Claude session; returns the screen file. Raises Refused or CloseFailed."""
+    pid, uuid = s.get("pid"), s["sessionId"]
+    name = s.get("name") or uuid
+    try:
+        pane_id = check_closeable(s)
+    except Refused as e:
+        log({"event": "refused", "by": by, "uuid": uuid, "name": name, "pid": pid, "reason": str(e)})
+        raise
+    idle_s = time.time() - (parse_ts(s.get("statusUpdatedAt")) or time.time())
+    mem = rss_mb(pid)
+    print(f"  status={s.get('status')}  idle={human_age(idle_s)}  mem={mem}MB  pane={pane_id}  cwd={s.get('cwd')}", flush=True)
+
+    # Capture BEFORE terminating: the conversation lives on the terminal's alternate screen,
+    # which is torn down the moment the process exits.
+    capture = subprocess.run(["tmux", "capture-pane", "-p", "-e", "-t", pane_id], capture_output=True, text=True).stdout
+    try:
+        terminate(pid)
+    except CloseFailed as e:
+        log({"event": "close_failed", "by": by, "uuid": uuid, "name": name, "pid": pid, "pane": pane_id, "reason": str(e)})
+        raise
+
+    closed_ts = time.time()
+    os.makedirs(SCREENS_DIR, exist_ok=True)
+    screen = os.path.join(SCREENS_DIR, f"{uuid}.txt")
+    with open(screen, "w", encoding="utf-8") as f:
+        f.write(f"───── CLOSED {dt_of(closed_ts)} · idle {human_age(idle_s)} · {mem}MB freed ─────\n")
+        f.write(capture if capture.endswith("\n") else capture + "\n")
+        f.write(f"───── resume: claude --resume {uuid} (typed below: press Enter) ─────\n")
+
+    # cat puts the text in the pane's normal screen, so it stays; the resume command is typed
+    # without Enter: the pane becomes its own resume button.
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, f"cat {shlex.quote(screen)}", "Enter"])
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, f"claude --resume {uuid}"])
+    subprocess.run(["tmux", "select-pane", "-t", pane_id, "-T", f"closed: {name}"], stderr=subprocess.DEVNULL)
+    log({"event": "close", "by": by, "uuid": uuid, "name": name, "pid": pid, "pane": pane_id,
+         "idle_minutes": int(idle_s // 60), "last_prompt_ts": s.get("_last_prompt_ts"), "mem_mb_freed": mem,
+         "screen_file": screen})
+    print(f"  closed: {mem}MB freed. Screen file: {screen}", flush=True)
+    return screen
+
+
+# -- Commands ------------------------------------------------------------------------
+
+def cmd_close(target: str) -> int:
+    try:
+        s = find_session(target)
+        print(f"Target: {s.get('name') or s['sessionId']} (pid {s.get('pid')}, Claude session {s['sessionId']})", flush=True)
+        close(s, by="hand")
+        return 0
+    except (Refused, CloseFailed) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_idle(over_h: float, dry_run: bool) -> int:
+    """Claude sessions whose status is idle and whose last prompt is older than over_h hours."""
+    now = time.time()
+    l_sessions = live_sessions()
+    l_picked = []
+    for s in l_sessions:
+        if s.get("status") != "idle":
+            continue
+        ts = last_prompt_ts(s)
+        if ts is None:
+            print(f"  skipped {s['sessionId'][:8]} ({s.get('name')}): no last prompt found (no transcript)", file=sys.stderr)
+            continue
+        if now - ts > over_h * 3600:
+            s["_last_prompt_ts"] = int(ts)
+            l_picked.append(s)
+    l_picked.sort(key=lambda s: s["_last_prompt_ts"])
+    print(f"{len(l_picked)} of {len(l_sessions)} running Claude sessions are idle with a last prompt older than {over_h:g} h"
+          f"{' (dry run: nothing closed)' if dry_run else ''}")
+    failed = 0
+    for s in l_picked:
+        print(f"{s['sessionId'][:8]}  last prompt {human_age(now - s['_last_prompt_ts'])} ago ({dt_of(s['_last_prompt_ts'])})"
+              f"  pid {s.get('pid')}  {s.get('name')}  {s.get('cwd')}", flush=True)
+        try:
+            if dry_run:
+                print(f"  would close (pane {check_closeable(s)})")
+            else:
+                close(s, by=f"idle --over {over_h:g}")
+        except Refused as e:
+            print(f"  {'would refuse' if dry_run else 'refused'}: {e}")
+        except CloseFailed as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            failed += 1
+    return 1 if failed else 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="agent-auto-close", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"agent-auto-close {VERSION}")
+    sub = p.add_subparsers(dest="command", required=True)
+    pc = sub.add_parser("close", help="close one running Claude session (by uuid, uuid prefix or %%pane)")
+    pc.add_argument("target", help="the Claude session's uuid, a unique uuid prefix, or its tmux %%pane")
+    pi = sub.add_parser("idle", help="close the Claude sessions idle for longer than --over hours")
+    pi.add_argument("--over", type=float, required=True, metavar="HOURS", help="last prompt older than this many hours")
+    pi.add_argument("--dry-run", action="store_true", help="list them and run the safety checks; close nothing")
+    args = p.parse_args()
+    if args.command == "close":
+        return cmd_close(args.target)
+    if args.over <= 0:
+        p.error("--over must be more than 0 hours")
+    return cmd_idle(args.over, args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
