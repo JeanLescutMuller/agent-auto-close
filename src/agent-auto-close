@@ -155,6 +155,17 @@ def is_tool_result(entry: Dict[str, Any]) -> bool:
     return isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
 
 
+def is_not_typed(e: Dict[str, Any]) -> bool:
+    """A `user` entry the user did not type: a meta entry (the /rename reminder, a skill's text), a compact
+    summary, a task notification or a system reminder. agent-tracker's last_prompt skips the same ones."""
+    if e.get("isMeta") or e.get("isCompactSummary"):
+        return True
+    content = (e.get("message") or {}).get("content")
+    if isinstance(content, list):
+        content = " ".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text")
+    return isinstance(content, str) and content.lstrip().startswith(("<task-notification>", "<system-reminder>"))
+
+
 def last_prompt_ts(s: Dict[str, Any]) -> Optional[float]:
     """The last prompt's time: agent-tracker's when it gives one, else the end of the transcript
     (the last `user` entry that is not a tool result). Reads 1 MB from the end, then 4x more each
@@ -180,7 +191,7 @@ def last_prompt_ts(s: Dict[str, Any]) -> Optional[float]:
                 e = json.loads(raw)
             except ValueError:
                 continue                   # a line being written right now
-            if isinstance(e, dict) and e.get("type") == "user" and not is_tool_result(e):
+            if isinstance(e, dict) and e.get("type") == "user" and not is_tool_result(e) and not is_not_typed(e):
                 ts = parse_ts(e.get("timestamp"))
                 if ts:
                     return ts

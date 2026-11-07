@@ -116,15 +116,18 @@ stop_fake() {   # SIGTERM one fake this script started, and wait for it
 echo "sandbox: $S" > "$LOG"
 
 # -- 1. install.sh, only with HOME=<sandbox> ---------------------------------------
+# The real install (the tool is deployed since 2026-11-07): its files and link must not change during the suite.
+real_install_fp() { { find "$REAL_HOME/opt/agent-auto-close" -type f -exec md5 -q {} \; 2>/dev/null; readlink "$REAL_HOME/.local/bin/agent-auto-close"; } | md5 -q; }
+REAL_FP_BEFORE=$(real_install_fp)
 bash "$REPO/install.sh" >> "$LOG" 2>&1; check "install exits 0" test $? -eq 0
 check "install: link in ~/.local/bin points into ~/opt/agent-auto-close" test "$(readlink "$AAC")" = "$HOME/opt/agent-auto-close/bin/agent-auto-close"
 check "install: deployed copy runs" "$AAC" --version
 bash "$REPO/install.sh" >> "$LOG" 2>&1; check "install: re-run is idempotent" test $? -eq 0 -a -L "$AAC"
-check "install: nothing written in the real HOME" test ! -e "$REAL_HOME/opt/agent-auto-close" -a ! -L "$REAL_HOME/.local/bin/agent-auto-close"
+check "install: nothing written in the real HOME" test "$(real_install_fp)" = "$REAL_FP_BEFORE"
 
 # -- 2. the sandbox tmux server ---------------------------------------------------------
 tmx new-session -d -s test -x 200 -y 50 -c "$S" "bash --norc --noprofile"
-check "tmux: the server's socket is the sandbox one" test "$(tmux display -p '#{socket_path}')" = "$SOCK"
+check "tmux: the server's socket is the sandbox one (or tmux_guard's)" test "$(tmux display -p '#{socket_path}')" = "${TMUX_GUARD_SOCKET:-$SOCK}"
 PANE0=$(tmx display -p -t test:0 '#{pane_id}')
 
 # -- 3. refusals: nothing is signalled ------------------------------------------------
