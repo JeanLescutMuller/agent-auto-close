@@ -1,6 +1,6 @@
 # agent-auto-close
 
-**Close running Claude sessions to free memory, leaving each one resumable in its own tmux pane: by hand, or the ones idle for longer than N hours.**
+**Close running Claude Code sessions to free memory, leaving each one resumable in its own tmux pane: by hand, or the ones idle for longer than N hours.**
 
 ## The big picture
 
